@@ -349,6 +349,15 @@ dialog.dlg::backdrop { background: rgba(0, 0, 0, 0.5); }
 .row3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
 @media (max-width: 640px) { .row3 { grid-template-columns: 1fr; } }
 .notice .btn + .btn { margin-left: -4px; }
+dialog.dlg.wide { width: min(980px, calc(100vw - 24px)); max-width: none; }
+table.imp td, table.imp th { white-space: nowrap; padding: 6px 8px; font-size: 13px; }
+table.imp .code-in { width: 84px; padding: 4px 6px; min-height: 0; }
+table.imp .st.dup { color: var(--ink-3); }
+table.imp .st.bad { color: var(--danger); font-weight: 600; }
+.tag.deposit { background: color-mix(in srgb, var(--c6) 16%, transparent); }
+.tag.withdraw { background: color-mix(in srgb, var(--c8) 16%, transparent); }
+tr.cash-row td { background: color-mix(in srgb, var(--ink-3) 7%, transparent); }
+tr.cash-row .btn.link { margin-right: 6px; }
 </style>
 </head>
 <body>
@@ -585,12 +594,18 @@ const Profiles = (function () {
  *   div   現金股利：qty = 參與配息股數，price = 每股配息，fee = 補充保費／匯費等扣款
  *   sdiv  股票股利（配股）：qty = 配發股數，fee = 扣款（例如補充保費）；總成本不變
  *   split 分割／合併／減資：qty = 換股比例（新股數 ÷ 舊股數），price = 每股（舊股）退還現金
+ *   deposit  入金：asset = 'TWD'，qty = 金額
+ *   withdraw 提領：asset = 'TWD'，qty = 金額
+ * 現金（交割帳戶）：賣出、股利、減資退款會留在帳上成為現金；買入先扣現金，
+ * 現金不夠的部分視為「另外投入的本金」（自動入金）；只有提領才離開總資產。
  * ------------------------------------------------------------------ */
 const Engine = (function () {
   const EPS = 1e-9;
   // 同一時間：公司行動（分割、配股）先套用，再處理買入、配息，最後才是賣出；最後以 id 穩定排序
-  const TYPE_ORDER = { split: 0, sdiv: 1, buy: 2, div: 3, sell: 4 };
-  const TYPES = ['buy', 'sell', 'div', 'sdiv', 'split'];
+  const TYPE_ORDER = { deposit: -1, split: 0, sdiv: 1, buy: 2, div: 3, sell: 4, withdraw: 5 };
+  const TYPES = ['buy', 'sell', 'div', 'sdiv', 'split', 'deposit', 'withdraw'];
+  const CASH = 'TWD';
+  function isCashTx(t) { return t.type === 'deposit' || t.type === 'withdraw'; }
 
   function sortTx(txs) {
     return txs.slice().sort((a, b) => {
@@ -632,11 +647,30 @@ const Engine = (function () {
     const positions = {};
     const events = {};
     const issues = [];
+    // 現金：balance 餘額；deposits 手動入金；autoIn 買入時現金不足而自動視為投入的本金；withdrawn 提領
+    const cash = { balance: 0, deposits: 0, autoIn: 0, withdrawn: 0 };
+    const cashIn = (v) => { cash.balance += v; };
+    const cashOut = (v) => {
+      if (v <= cash.balance + EPS) cash.balance -= v;
+      else { cash.autoIn += v - cash.balance; cash.balance = 0; }
+    };
 
     for (const tx of sortTx(txs)) {
       if (tx.ts > upTo) break;
       const fee = tx.fee || 0;
       const tax = tx.tax || 0;
+      if (tx.type === 'deposit') {
+        cash.balance += tx.qty; cash.deposits += tx.qty;
+        events[tx.id] = { type: 'deposit', cash: tx.qty };
+        continue;
+      }
+      if (tx.type === 'withdraw') {
+        let amt = tx.qty;
+        if (amt > cash.balance + EPS) { issues.push({ id: tx.id, kind: 'overdraw', asset: CASH, short: amt - cash.balance }); amt = Math.max(cash.balance, 0); }
+        cash.balance -= amt; cash.withdrawn += amt;
+        events[tx.id] = { type: 'withdraw', cash: amt };
+        continue;
+      }
       const p = positions[tx.asset] || (positions[tx.asset] = newPos(tx.asset));
 
       if (tx.type === 'buy') {
@@ -649,6 +683,7 @@ const Engine = (function () {
         p.boughtQty += tx.qty;
         p.boughtCost += total;
         if (method === 'fifo') p.lots.push({ qty: tx.qty, unit: total / tx.qty });
+        cashOut(total);
         events[tx.id] = { type: 'buy', total };
       } else if (tx.type === 'sell') {
         p.lastPrice = tx.price;
@@ -682,12 +717,14 @@ const Engine = (function () {
         p.realized += pnl;
         p.soldQty += q;
         p.soldProceeds += proceeds;
+        cashIn(proceeds);
         events[tx.id] = { type: 'sell', proceeds, costOut, pnl, qty: q };
       } else if (tx.type === 'div') {
-        const cash = tx.qty * tx.price - fee;
-        p.realized += cash;
-        p.dividends += cash;
-        events[tx.id] = { type: 'div', cash, pnl: cash };
+        const got = tx.qty * tx.price - fee;
+        p.realized += got;
+        p.dividends += got;
+        cashIn(got);
+        events[tx.id] = { type: 'div', cash: got, pnl: got };
       } else if (tx.type === 'sdiv') {
         if (p.qty <= EPS) issues.push({ id: tx.id, kind: 'nopos', asset: tx.asset });
         const before = p.qty;
@@ -696,7 +733,7 @@ const Engine = (function () {
           if (before > EPS) scaleLots(p, p.qty / before);
           else p.lots.push({ qty: tx.qty, unit: 0 });
         }
-        if (fee) { p.realized -= fee; p.dividends -= fee; }
+        if (fee) { p.realized -= fee; p.dividends -= fee; cashOut(fee); }
         events[tx.id] = { type: 'sdiv', qty: tx.qty, pnl: fee ? -fee : 0 };
       } else if (tx.type === 'split') {
         const ratio = tx.qty;
@@ -708,24 +745,25 @@ const Engine = (function () {
           let after = before * ratio;
           // 台股減資／合併：不足一股的零股以現金發還，這裡直接捨去（金額很小，可另用「退還現金」補記）
           if (Math.abs(before - Math.round(before)) < EPS) after = Math.floor(after + 1e-6);
-          const cash = Math.max(0, before * (tx.price || 0) - fee);
+          const back0 = Math.max(0, before * (tx.price || 0) - fee);
           const costBefore = p.cost;
           p.qty = after;
           if (method === 'fifo') scaleLots(p, after / before);
           // 減資退還的現金視為「拿回本金」：先沖減成本，超過成本的部分才算已實現獲利
           let gain = 0;
-          if (cash > 0) {
-            const back = Math.min(cash, costBefore);
-            gain = cash - back;
+          if (back0 > 0) {
+            const back = Math.min(back0, costBefore);
+            gain = back0 - back;
             p.cost -= back;
             if (method === 'fifo' && costBefore > 0) {
               const k = p.cost / costBefore;
               p.lots.forEach((l) => { l.unit *= k; });
             }
-            p.returned += cash;
+            p.returned += back0;
             p.realized += gain;
+            cashIn(back0);
           }
-          events[tx.id] = { type: 'split', before, after, cash, pnl: gain };
+          events[tx.id] = { type: 'split', before, after, cash: back0, pnl: gain };
         }
       }
 
@@ -736,7 +774,8 @@ const Engine = (function () {
       const p = positions[a];
       p.avgCost = p.qty > 0 ? p.cost / p.qty : 0;
     }
-    return { positions, events, issues };
+    cash.invested = cash.deposits + cash.autoIn - cash.withdrawn; // 淨投入本金
+    return { positions, events, issues, cash };
   }
 
   /**
@@ -778,7 +817,8 @@ const Engine = (function () {
       rows.push(row);
     }
     rows.sort((x, y) => (y.value || 0) - (x.value || 0));
-    for (const r of rows) r.share = r.value != null && value > 0 ? r.value / value : null;
+    const cashBal = result.cash ? Math.max(0, result.cash.balance) : 0;
+    for (const r of rows) r.share = r.value != null && value + cashBal > 0 ? r.value / (value + cashBal) : null;
     const unrealized = value - cost;
     return {
       rows, missing, value, cost, unrealized,
@@ -788,6 +828,9 @@ const Engine = (function () {
       totalPct: bought > 0 ? (unrealized + realized) / bought : null,
       dayChange,
       dayChangePct: value - dayChange > 0 ? dayChange / (value - dayChange) : null,
+      cash: result.cash ? result.cash.balance : 0,
+      invested: result.cash ? result.cash.invested : 0,
+      totalValue: value + (result.cash ? result.cash.balance : 0),
     };
   }
 
@@ -906,6 +949,7 @@ const Engine = (function () {
         value += p.qty * px;
         cost += p.cost;
       }
+      if (o.includeCash) { value += r.cash.balance; cost = r.cash.invested; }
       return { ts, value, cost };
     }
 
@@ -925,7 +969,7 @@ const Engine = (function () {
     return p ? p.qty : 0;
   }
 
-  return { EPS, TYPES, sortTx, isTrade, replay, summarize, assetBars, tierState, checkAlerts, netWorthSeries, lastTradePrice, qtyBefore };
+  return { EPS, TYPES, CASH, isCashTx, sortTx, isTrade, replay, summarize, assetBars, tierState, checkAlerts, netWorthSeries, lastTradePrice, qtyBefore };
 })();
 if (typeof module !== 'undefined' && module.exports) module.exports = Engine;
 
@@ -1566,7 +1610,7 @@ function lineChart(container, pts, o) {
     Tip.show(cx, cy, [
       h('div', { class: 'tip-head' }, (o.name ? o.name + '　' : '') + (isNow ? '現在　' + fmtDT(p.ts) : fmtDate(p.ts, true) + '（收盤）')),
       tipRow(col, '市值', fmtMoney(p.value, cur), true),
-      tipRow('var(--ink-3)', '持股成本', fmtMoney(p.cost, cur), true),
+      tipRow('var(--ink-3)', o.costLabel || '持股成本', fmtMoney(p.cost, cur), true),
       tipRow(null, '未實現損益', fmtSigned(pnl, cur) + (p.cost > 0 ? '（' + fmtPct(pnl / p.cost, true) + '）' : ''), false),
     ]);
     if (fromKeyboard) svg.setAttribute('data-idx', i);
@@ -1602,7 +1646,7 @@ function lineChart(container, pts, o) {
 
   const legend = h('div', { class: 'legend' },
     h('span', { class: 'lg-item' }, h('span', { class: 'lg-line', style: { background: col } }), '市值'),
-    h('span', { class: 'lg-item' }, h('span', { class: 'lg-line', style: { background: 'var(--ink-3)' } }), '持股成本'));
+    h('span', { class: 'lg-item' }, h('span', { class: 'lg-line', style: { background: 'var(--ink-3)' } }), o.costLabel || '持股成本'));
   if (!compact_) container.appendChild(legend);
   container.appendChild(svg);
 }
@@ -1891,7 +1935,7 @@ function assetBarChart(container, allBars, o) {
 const $root = document.getElementById('root');
 const PREF_KEY = 'twstockledger.ui.v1';
 const COMMON_ASSETS = ['2330', '0050', '0056', '00878', '2317', '2454', '2881', '2882', '2891', '2412', '006208', '00919'];
-const TX_LABEL = { buy: '買入', sell: '賣出', div: '現金股利', sdiv: '股票股利', split: '分割／減資' };
+const TX_LABEL = { buy: '買入', sell: '賣出', div: '現金股利', sdiv: '股票股利', split: '分割／減資', deposit: '入金', withdraw: '提領' };
 
 let session = null;      // { key, salt, iter }
 let data = null;         // 解密後的資料（只在解鎖期間存在於記憶體）
@@ -1936,7 +1980,7 @@ function loadStockInfo() {
   if (c) stockInfo = c.map;
   Market.fetchInfo(false).then((m) => { const was = !!stockInfo; stockInfo = m; if (data && !was) renderAll(); }).catch(() => { /* 名稱只是輔助顯示 */ });
 }
-function nameOf(code) { const r = stockInfo && stockInfo[code]; return r ? r[0] : ''; }
+function nameOf(code) { if (code === Engine.CASH) return '現金'; const r = stockInfo && stockInfo[code]; return r ? r[0] : ''; }
 function isEtfInfo(code) { const r = stockInfo && stockInfo[code]; return !!(r && /ETF|ETN|受益證券/.test(r[2] || '')); }
 function taxKindOf(code) {
   const g = TwRules.guessTaxKind(code);
@@ -1944,7 +1988,7 @@ function taxKindOf(code) {
   return g;
 }
 /** 顯示用：「2330 台積電」 */
-function stockLabel(code) { const n = nameOf(code); return n ? code + ' ' + n : code; }
+function stockLabel(code) { if (code === Engine.CASH) return '現金（NTD）'; const n = nameOf(code); return n ? code + ' ' + n : code; }
 function stockNode(code) {
   const n = nameOf(code);
   return n ? [code, h('span', { class: 'sname' }, n)] : [code];
@@ -2214,7 +2258,7 @@ function histClose(a, dayStart) {
 async function loadHistory() {
   if (!session) return;
   const first = {};
-  for (const t of data.txs) if (first[t.asset] == null || t.ts < first[t.asset]) first[t.asset] = t.ts;
+  for (const t of data.txs) if (!Engine.isCashTx(t) && (first[t.asset] == null || t.ts < first[t.asset])) first[t.asset] = t.ts;
   const todo = Object.keys(first).filter((a) => !hist.closes[a] || hist.closes[a].start > twDayStart(first[a]) - 10 * DAY);
   if (!todo.length) { renderChart(); renderAssetCurves(); renderReturns(); loadCorpActions(); return; }
   hist.status = 'loading';
@@ -2238,7 +2282,7 @@ async function loadHistory() {
 async function loadCorpActions(force) {
   if (!session || corp.status === 'loading') return;
   const first = {};
-  for (const t of data.txs) if (first[t.asset] == null || t.ts < first[t.asset]) first[t.asset] = t.ts;
+  for (const t of data.txs) if (!Engine.isCashTx(t) && (first[t.asset] == null || t.ts < first[t.asset])) first[t.asset] = t.ts;
   const fresh = corp.status === 'ready' && Date.now() - corp.at < 6 * 3600000;
   // 已查過且還新鮮的個股不重查；新增的個股（或第一筆交易往前移）才補查
   const codes = Object.keys(first).filter((a) => force || !fresh || !corp.byAsset[a] || corp.start[a] > first[a]);
@@ -2531,6 +2575,8 @@ function renderNotices(C) {
     const nopos = C.result.issues.filter((i) => i.kind === 'nopos');
     if (over.length) list.push(notice('有 ' + over.length + ' 筆賣出超過當時持股（例如 ' + stockLabel(over[0].asset) + '），請檢查交易紀錄。'));
     if (nopos.length) list.push(notice('有 ' + nopos.length + ' 筆配股／分割發生時沒有持股（例如 ' + stockLabel(nopos[0].asset) + '），請檢查日期。'));
+    const od = C.result.issues.filter((i) => i.kind === 'overdraw');
+    if (od.length) list.push(notice('有 ' + od.length + ' 筆提領超過當時的現金餘額，超過的部分沒有計入，請檢查交易紀錄。'));
   }
   if (syncSt.status === 'error' && syncSt.code !== 'NETWORK' && syncSt.code !== 'RATE') list.push(notice('雲端同步失敗：' + syncSt.error, ['重試', () => runSync('manual')]));
   corpSuggestions().slice(0, 5).forEach((s) => {
@@ -2584,8 +2630,8 @@ function renderSummary(C) {
   const S = C.summary, cur = C.cur;
   const hasPct = S.rows.some((r) => r.pct != null);
   el.summary.appendChild(h('div', null,
-    h('div', { class: 'hero-label' }, '總資產（市值）'),
-    h('div', { class: 'hero-value' }, fmtMoney(S.value, cur)),
+    h('div', { class: 'hero-label' }, S.cash ? '總資產（股票市值＋現金）' : '總資產（市值）'),
+    h('div', { class: 'hero-value' }, fmtMoney(S.totalValue, cur)),
     hasPct ? h('div', { class: 'hero-delta ' + signClass(S.dayChange) },
       pnlText(S.dayChange, cur) + (S.dayChangePct != null ? '（' + fmtPct(S.dayChangePct, true) + '）' : ''),
       h('span', { class: 'muted' }, '　最近交易日 vs 前一日')) : null));
@@ -2594,7 +2640,8 @@ function renderSummary(C) {
     h('div', { class: 't-value ' + (cls || '') }, value),
     h('div', { class: 't-sub' }, sub));
   el.summary.appendChild(h('div', { class: 'kpis' },
-    tile('持股成本', fmtMoney(S.cost, cur), S.rows.length + ' 檔持股'),
+    tile('股票市值', fmtMoney(S.value, cur), S.rows.length + ' 檔持股，成本 ' + fmtMoney(S.cost, cur)),
+    tile('現金（NTD）', fmtMoney(S.cash, cur), '賣出與股利留在帳上的錢；淨投入本金 ' + fmtMoney(S.invested, cur)),
     tile('未實現損益', pnlText(S.unrealized, cur), S.unrealizedPct != null ? fmtPct(S.unrealizedPct, true) + '（相對持股成本）' : '—', signClass(S.unrealized)),
     tile('已實現損益', pnlText(S.realized, cur), '含股利；手續費 ' + fmtMoney(S.fees, cur) + '、證交稅 ' + fmtMoney(S.taxes, cur), signClass(S.realized)),
     tile('累計股利', fmtMoney(S.dividends, cur), '現金股利實收（已扣補充保費等）', ''),
@@ -2631,10 +2678,10 @@ function getSeries(C) {
   const now = Date.now();
   const key = seriesKey(C);
   if (seriesCache.key !== key) {
-    const all = Engine.netWorthSeries(data.txs, seriesOpts(C, dayEnds(), now));
+    const all = Engine.netWorthSeries(data.txs, Object.assign(seriesOpts(C, dayEnds(), now), { includeCash: true }));
     seriesCache = { key, pts: all.slice(0, -1) };
   }
-  const nowPt = Engine.netWorthSeries(data.txs, seriesOpts(C, [], now)).pop();
+  const nowPt = Engine.netWorthSeries(data.txs, Object.assign(seriesOpts(C, [], now), { includeCash: true })).pop();
   return seriesCache.pts.concat([nowPt]);
 }
 function renderChart() {
@@ -2644,7 +2691,7 @@ function renderChart() {
   const range = RANGES.filter((r) => r[0] === data.settings.range)[0] || RANGES[4];
   el.chart.appendChild(h('div', { class: 'card-head' },
     h('h2', null, '資產淨值曲線'),
-    h('span', { class: 'card-sub' }, '市值 vs 持股成本 · ' + (C.method === 'fifo' ? 'FIFO' : '加權平均')),
+    h('span', { class: 'card-sub' }, '總資產（股票＋現金）vs 淨投入本金'),
     h('button', { class: 'btn small', type: 'button', 'aria-pressed': String(uiState.chartTable), onclick: () => { uiState.chartTable = !uiState.chartTable; renderChart(); } },
       uiState.chartTable ? '顯示圖表' : '表格檢視')));
 
@@ -2671,7 +2718,7 @@ function renderChart() {
     body.className = 'chart-body';
     body.appendChild(chartTable(pts, C.cur));
   } else {
-    lineChart(body, pts, { cur: C.cur });
+    lineChart(body, pts, { cur: C.cur, costLabel: '淨投入本金' });
     if (!body._ro && window.ResizeObserver) {
       let lastW = body.clientWidth;
       body._ro = new ResizeObserver(() => {
@@ -2683,7 +2730,7 @@ function renderChart() {
   }
   const notes = [];
   if (hist.failed.length) notes.push('無法取得 ' + hist.failed.join('、') + ' 的歷史價格，曲線以該股的成交價估算。');
-  notes.push('歷史市值採用每日收盤價（未還原權息；配股、分割請記在帳本裡）。非交易日沿用前一個交易日收盤。');
+  notes.push('總資產 = 股票市值 + 現金（賣出、股利留在帳上的錢）；淨投入本金 = 入金 + 買股時現金不足自動視為投入的錢 − 提領，兩線差距就是總損益。歷史市值採用每日收盤價（未還原權息），非交易日沿用前一個交易日收盤。');
   el.chart.appendChild(h('p', { class: 'foot' }, notes.join(' ')));
 }
 function chartTable(pts, cur) {
@@ -2694,7 +2741,7 @@ function chartTable(pts, cur) {
     h('td', { class: signClass(p.value - p.cost) }, fmtSigned(p.value - p.cost, cur))));
   return h('div', { class: 'tablewrap', style: { maxHeight: '340px', overflowY: 'auto' } },
     h('table', null,
-      h('thead', null, h('tr', null, h('th', null, '日期'), h('th', null, '市值'), h('th', null, '持股成本'), h('th', null, '未實現損益'))),
+      h('thead', null, h('tr', null, h('th', null, '日期'), h('th', null, '總資產'), h('th', null, '淨投入本金'), h('th', null, '總損益'))),
       h('tbody', null, rows)));
 }
 
@@ -2901,7 +2948,12 @@ function barsTable(bars, cur) {
 /* ---------- 資產配置 ---------- */
 function assetOrder() {
   const first = {};
-  for (const t of Engine.sortTx(data.txs)) if (first[t.asset] == null) first[t.asset] = Object.keys(first).length;
+  // 顏色依「目前持有」的個股優先分配（已出清的排後面），持股多時不會被舊股票佔掉顏色
+  const held = {};
+  ((lastC && lastC.summary.rows) || []).forEach((r) => { held[r.asset] = 1; });
+  const seq = Engine.sortTx(data.txs).filter((t) => !Engine.isCashTx(t));
+  seq.forEach((t) => { if (held[t.asset] && first[t.asset] == null) first[t.asset] = Object.keys(first).length; });
+  seq.forEach((t) => { if (first[t.asset] == null) first[t.asset] = Object.keys(first).length; });
   return first;
 }
 function colorOf(order) {
@@ -2912,7 +2964,9 @@ function renderAlloc(C) {
   el.alloc.appendChild(h('div', { class: 'card-head' }, h('h2', null, '資產配置'), h('span', { class: 'card-sub' }, '依目前市值占比；明細見下方持股表')));
   const body = h('div');
   el.alloc.appendChild(body);
-  allocBar(body, C.summary.rows, { cur: C.cur, colorOf: colorOf(assetOrder()) });
+  const cashRow = C.summary.cash > 0.5 ? [{ asset: '現金', value: C.summary.cash }] : [];
+  const col0 = colorOf(assetOrder());
+  allocBar(body, C.summary.rows.concat(cashRow), { cur: C.cur, colorOf: (a) => (a === '現金' ? 'var(--ink-3)' : col0(a)) });
 }
 
 /* ---------- 排序 / 篩選共用 ---------- */
@@ -3030,8 +3084,8 @@ function renderHoldings(C) {
   el.holdHead.appendChild(h('div', { class: 'card-head' }, h('h2', null, '持股'),
     h('span', { class: 'card-sub' }, '單位：新台幣、股' + (active ? '　顯示 ' + shown.length + ' / ' + S.rows.length + ' 檔' : ''))));
   clear(el.holdBody);
-  if (!S.rows.length) { el.holdBody.appendChild(h('p', { class: 'muted' }, '目前沒有持股。')); return; }
-  if (!shown.length) { el.holdBody.appendChild(h('p', { class: 'muted' }, '沒有符合篩選條件的持股。')); return; }
+  if (!S.rows.length && !S.cash) { el.holdBody.appendChild(h('p', { class: 'muted' }, '目前沒有持股。')); return; }
+  if (!shown.length && !(S.cash && !active)) { el.holdBody.appendChild(h('p', { class: 'muted' }, '沒有符合篩選條件的持股。')); return; }
   const order = assetOrder(), col = colorOf(order);
   const rows = shown.map((r) => {
     const c = col(r.asset);
@@ -3060,10 +3114,24 @@ function renderHoldings(C) {
       h('td', { 'data-label': '預計收益', class: 'col-expprofit' },
         expectedProfit(r) != null ? arrow(expectedProfit(r)) + fmtSigned(expectedProfit(r), cur) + (expectedPct(r) != null ? '（' + fmtPct(expectedPct(r), true) + '）' : '') : '—'));
   });
+  // 現金列：賣出、股利留在帳上的新台幣（篩選個股時不顯示）
+  const showCash = !active && Math.abs(S.cash) > 0.5;
+  if (showCash) {
+    rows.push(h('tr', { class: 'cash-row' },
+      h('td', { 'data-label': '個股' }, h('span', { class: 'asset' }, h('span', { class: 'lg-box', style: { background: 'var(--ink-3)' } }), '現金', h('span', { class: 'sname' }, 'NTD'))),
+      h('td', { 'data-label': '股數' }, '—'), h('td', { 'data-label': '平均成本' }, '—'), h('td', { 'data-label': '成本金額' }, '—'),
+      h('td', { 'data-label': '現價' }, h('button', { class: 'btn link', type: 'button', onclick: () => openTxDialog(null, { type: 'withdraw', asset: Engine.CASH }) }, '提領'),
+        h('button', { class: 'btn link', type: 'button', onclick: () => openTxDialog(null, { type: 'deposit', asset: Engine.CASH }) }, '入金')),
+      h('td', { 'data-label': '漲跌' }, '—'),
+      h('td', { 'data-label': '市值' }, fmtMoney(S.cash, cur)),
+      h('td', { 'data-label': '占比' }, S.totalValue > 0 ? fmtPct(S.cash / S.totalValue) : '—'),
+      h('td', { 'data-label': '未實現損益' }, '—'), h('td', { 'data-label': '已實現（含息）' }, '—'), h('td', { 'data-label': '累計股利' }, '—'),
+      h('td'), h('td')));
+  }
   // 合計：沒篩選時用全部（已實現、股利含已出清）；篩選時只加總顯示中的個股
   const sum = (f) => shown.reduce((a, r) => a + (f(r) || 0), 0);
   const tCost = active ? sum((r) => r.cost) : S.rows.reduce((a, r) => a + r.cost, 0);
-  const tValue = active ? sum((r) => r.value) : S.value;
+  const tValue = active ? sum((r) => r.value) : S.value + (showCash ? S.cash : 0);
   const tUnreal = active ? sum((r) => r.unrealized) : S.unrealized;
   const tReal = active ? sum((r) => r.realized) : S.realized;
   const tDiv = active ? sum((r) => r.dividends) : S.dividends;
@@ -3120,6 +3188,8 @@ function buildTxBar() {
   return { node, selA, selT, q, from, to, sort, dir, clr, assetsKey: null };
 }
 function txSummaryText(t) {
+  if (t.type === 'deposit') return '入金 ' + fmtMoney(t.qty, 'TWD');
+  if (t.type === 'withdraw') return '提領 ' + fmtMoney(t.qty, 'TWD');
   if (t.type === 'div') return '現金股利 ' + stockLabel(t.asset) + ' ' + fmtQty(t.qty) + ' 股 × ' + num(t.price, 0, 4) + ' 元';
   if (t.type === 'sdiv') return '股票股利 ' + stockLabel(t.asset) + ' 配 ' + fmtQty(t.qty) + ' 股';
   if (t.type === 'split') return '分割／減資 ' + stockLabel(t.asset) + ' 1 股換 ' + num(t.qty, 0, 6) + ' 股';
@@ -3172,7 +3242,9 @@ function renderTx(C) {
   const rows = list.map((t) => {
     const ev = C.result.events[t.id];
     let qtyTxt, priceTxt, amtTxt;
-    if (t.type === 'split') {
+    if (Engine.isCashTx(t)) {
+      qtyTxt = '—'; priceTxt = '—'; amtTxt = (t.type === 'withdraw' ? MINUS : '+') + fmtMoney(t.qty, cur);
+    } else if (t.type === 'split') {
       qtyTxt = '1 換 ' + num(t.qty, 0, 6);
       priceTxt = t.price ? '退 ' + num(t.price, 0, 4) + '/股' : '—';
       amtTxt = ev && ev.before ? fmtQty(ev.before) + ' → ' + fmtQty(ev.after) + ' 股' : '—';
@@ -3183,12 +3255,12 @@ function renderTx(C) {
     } else {
       qtyTxt = fmtQty(t.qty); priceTxt = fmtPrice(t.price, cur); amtTxt = fmtMoney(t.qty * t.price, cur);
     }
-    const pnl = ev && ev.pnl != null && (t.type !== 'buy') ? ev.pnl : null;
+    const pnl = ev && ev.pnl != null && t.type !== 'buy' && !Engine.isCashTx(t) ? ev.pnl : null;
     const showPnl = pnl != null && !(t.type === 'split' && !pnl) && !(t.type === 'sdiv' && !pnl);
     return h('tr', { class: badIds[t.id] ? 'bad' : '' },
       h('td', { 'data-label': '時間', class: 'l' }, fmtDT(t.ts)),
       h('td', { 'data-label': '類型', class: 'l' }, h('span', { class: 'tag ' + t.type }, TX_LABEL[t.type])),
-      h('td', { 'data-label': '個股', class: 'l' }, h('strong', null, t.asset), nameOf(t.asset) ? h('span', { class: 'sname blk' }, nameOf(t.asset)) : null),
+      h('td', { 'data-label': '個股', class: 'l' }, Engine.isCashTx(t) ? h('strong', null, '現金') : [h('strong', null, t.asset), nameOf(t.asset) ? h('span', { class: 'sname blk' }, nameOf(t.asset)) : null]),
       h('td', { 'data-label': '數量（股）' }, qtyTxt),
       h('td', { 'data-label': '價格' }, priceTxt),
       h('td', { 'data-label': '金額' }, amtTxt),
@@ -3277,7 +3349,9 @@ function openTxDialog(edit, preset) {
         // 買賣之間切換保留數字；換到股利、分割等欄位意義不同的類型時清空，避免誤用
         if (!(trade(k) && trade(type))) {
           inPrice.value = ''; inFee.value = ''; feeAuto = true;
-          if (k === 'split' || type === 'split') inQty.value = '';
+          const cashT = (x) => x === 'deposit' || x === 'withdraw';
+          if (k === 'split' || type === 'split' || cashT(k) !== cashT(type)) inQty.value = '';
+          if (!cashT(k) && inAsset.value.trim().toUpperCase() === Engine.CASH) { inAsset.value = ''; paintName(); }
         }
         type = k; paint();
       } }, TX_LABEL[k]))));
@@ -3306,6 +3380,7 @@ function openTxDialog(edit, preset) {
       unit = 1; inQty.value = String(q); paint();
     } }, '帶入持股');
 
+    const fieldAsset = h('div', { class: 'field' }, h('label', { for: 'f-asset' }, '股票代號'), inAsset, assetName);
     const fieldQty = h('div', { class: 'field' }, lblQty, h('div', { class: 'inline' }, inQty, unitCtl, fillHeld), hintQty);
     const fieldPrice = h('div', { class: 'field' }, lblPrice, h('div', { class: 'inline' }, inPrice, fillPrice), hintPrice);
     const fieldFee = h('div', { class: 'field' }, lblFee, inFee, hintFee);
@@ -3321,9 +3396,19 @@ function openTxDialog(edit, preset) {
       if (type === 'div' && feeAuto) inFee.value = amt > 0 ? String(TwRules.nhiPremium(amt)) : '';
       paintTotal();
     }
+    function cashAt() {
+      const ts = new Date(inTs.value).getTime();
+      const others = data.txs.filter((x) => !edit || x.id !== edit.id);
+      return Engine.replay(others, { method: 'avg', upTo: isFinite(ts) ? ts : Date.now() }).cash.balance;
+    }
     function paintTotal() {
       const amt = amount(), fee = parseFloat(inFee.value) || 0, tax = parseFloat(inTax.value) || 0;
       let txt = '';
+      if (type === 'deposit' || type === 'withdraw') {
+        const bal = cashAt(), v = parseFloat(inQty.value) || 0;
+        totalEl.textContent = '這個時間點的現金餘額 ' + fmtMoney(bal, 'TWD') + (v > 0 ? ' → ' + fmtMoney(type === 'deposit' ? bal + v : bal - v, 'TWD') : '');
+        return;
+      }
       if (type === 'buy' && amt >= 0) txt = '成交金額 ' + fmtMoney(amt, 'TWD') + '＋手續費 ' + fmtMoney(fee, 'TWD') + '＝應付 ' + fmtMoney(amt + fee, 'TWD');
       else if (type === 'sell' && amt >= 0) txt = '成交金額 ' + fmtMoney(amt, 'TWD') + '－手續費 ' + fmtMoney(fee, 'TWD') + '－證交稅 ' + fmtMoney(tax, 'TWD') + '＝實收 ' + fmtMoney(amt - fee - tax, 'TWD');
       else if (type === 'div' && amt >= 0) txt = '股利 ' + fmtMoney(amt, 'TWD') + '－扣款 ' + fmtMoney(fee, 'TWD') + '＝實收 ' + fmtMoney(amt - fee, 'TWD');
@@ -3339,15 +3424,18 @@ function openTxDialog(edit, preset) {
     }
     function paintName() {
       const a = inAsset.value.trim().toUpperCase();
-      const n = nameOf(a);
-      assetName.textContent = n ? n + (stockInfo[a][1] === 'tpex' ? '（上櫃）' : stockInfo[a][1] === 'twse' ? '（上市）' : stockInfo[a][1] === 'emerging' ? '（興櫃）' : '') : (a && stockInfo ? '查無此代號（仍可記錄）' : '');
+      const r = stockInfo && stockInfo[a];
+      assetName.textContent = r ? r[0] + (r[1] === 'tpex' ? '（上櫃）' : r[1] === 'twse' ? '（上市）' : r[1] === 'emerging' ? '（興櫃）' : '') : (a && stockInfo ? '查無此代號（仍可記錄）' : '');
     }
     function paint() {
       Engine.TYPES.forEach((k) => typeBtns[k].setAttribute('aria-checked', String(type === k)));
       Object.keys(unitBtns).forEach((k) => unitBtns[k].setAttribute('aria-checked', String(+k === unit)));
       const trade = type === 'buy' || type === 'sell';
+      const isCash = type === 'deposit' || type === 'withdraw';
+      fieldAsset.hidden = isCash;
+      fieldFee.hidden = isCash;
       unitCtl.hidden = !trade;
-      fillHeld.hidden = trade || type === 'split';
+      fillHeld.hidden = trade || type === 'split' || isCash;
       fillPrice.hidden = !trade;
       fieldTax.hidden = type !== 'sell';
       if (!trade && unit !== 1) { const q = parseFloat(inQty.value); if (q > 0) inQty.value = String(q * unit); unit = 1; }
@@ -3371,6 +3459,11 @@ function openTxDialog(edit, preset) {
         hintQty.textContent = '實際入帳的股數（每股配股 X 元 = 每千股配 X×100 股）；總成本不變，平均成本會下降';
         lblFee.textContent = '扣款（選填）';
         hintFee.textContent = '例如股票股利的補充保費';
+      } else if (isCash) {
+        lblQty.textContent = type === 'deposit' ? '入金金額（元）' : '提領金額（元）';
+        hintQty.textContent = type === 'deposit'
+          ? '從銀行轉進交割帳戶、準備買股的錢（選填：買股時現金不夠，帳本會自動把差額當作你投入的本金）'
+          : '從交割帳戶轉出、不再用來投資的錢；提領後就不計入總資產';
       } else {
         lblQty.textContent = '換股比例（1 股換幾股）';
         hintQty.textContent = '分割 1 拆 4 填 4；減資 30% 填 0.7；合併 2 股換 1 股填 0.5。不足一股的零股會捨去';
@@ -3379,7 +3472,7 @@ function openTxDialog(edit, preset) {
         lblFee.textContent = '扣款（選填）';
         hintFee.textContent = '例如減資退款的匯費';
       }
-      fieldPrice.hidden = type === 'sdiv';
+      fieldPrice.hidden = type === 'sdiv' || isCash;
       recalc();
     }
 
@@ -3400,17 +3493,19 @@ function openTxDialog(edit, preset) {
     const fail = (msg) => { err.textContent = msg; };
     const save = () => {
       err.textContent = '';
-      const asset = inAsset.value.trim().toUpperCase();
-      if (!/^[A-Z0-9]{1,10}$/.test(asset)) return fail('股票代號只能是英文字母與數字，例如 2330、00679B。');
+      const isCash = type === 'deposit' || type === 'withdraw';
+      const asset = isCash ? Engine.CASH : inAsset.value.trim().toUpperCase();
+      if (!isCash && !/^[A-Z0-9]{1,10}$/.test(asset)) return fail('股票代號只能是英文字母與數字，例如 2330、00679B。');
+      if (!isCash && asset === Engine.CASH) return fail('TWD 是現金專用代號，請改用「入金／提領」。');
       const ts = new Date(inTs.value).getTime();
       if (!isFinite(ts)) return fail('請選擇有效的日期時間。');
       if (ts > Date.now() + 5 * 60000) return fail('時間不能晚於現在。');
       let qty = parseFloat(inQty.value);
       if (!(qty > 0)) return fail(type === 'split' ? '換股比例必須大於 0。' : '數量必須大於 0。');
       if (type === 'buy' || type === 'sell') qty = Math.round(qty * unit * 1e6) / 1e6;
-      let price = type === 'sdiv' ? 0 : (inPrice.value === '' && type === 'split' ? 0 : parseFloat(inPrice.value));
+      let price = isCash ? 1 : type === 'sdiv' ? 0 : (inPrice.value === '' && type === 'split' ? 0 : parseFloat(inPrice.value));
       if (!(price >= 0)) return fail(type === 'div' ? '請輸入每股股利。' : '請輸入價格。');
-      const fee = inFee.value === '' ? 0 : parseFloat(inFee.value);
+      const fee = isCash || inFee.value === '' ? 0 : parseFloat(inFee.value);
       if (!(fee >= 0)) return fail('手續費／扣款不能是負數。');
       const tax = type === 'sell' ? (inTax.value === '' ? 0 : parseFloat(inTax.value)) : 0;
       if (!(tax >= 0)) return fail('證交稅不能是負數。');
@@ -3420,6 +3515,8 @@ function openTxDialog(edit, preset) {
       const issues = Engine.replay(next, { method: 'avg' }).issues;
       const over = issues.filter((i) => i.kind === 'oversell')[0];
       if (over) return fail('這樣會讓 ' + stockLabel(over.asset) + ' 賣出時超過持股（缺 ' + fmtQty(over.short) + ' 股）。請先補上買入紀錄或調整數量。');
+      const od = issues.filter((i) => i.kind === 'overdraw')[0];
+      if (od) return fail('提領金額超過當時的現金餘額（差 ' + fmtMoney(od.short, 'TWD') + '）。');
       const nopos = issues.filter((i) => i.id === nt.id && i.kind === 'nopos')[0];
       if (nopos) return fail('這個時間點之前沒有 ' + stockLabel(asset) + ' 的持股，無法記錄配股或分割。請確認日期。');
       close(true);
@@ -3429,10 +3526,10 @@ function openTxDialog(edit, preset) {
 
     return [
       h('h2', null, edit ? '編輯紀錄' : '新增紀錄'),
-      h('p', { class: 'lead' }, '金額以新台幣計，數量以股計。'),
+      h('p', { class: 'lead' }, '金額以新台幣計，數量以股計。賣出與股利的錢會留在帳上成為現金，提領才離開總資產。'),
       h('div', { class: 'field' }, h('span', { class: 'flabel' }, '類型'), typeCtl),
       h('div', { class: 'row2' },
-        h('div', { class: 'field' }, h('label', { for: 'f-asset' }, '股票代號'), inAsset, assetName),
+        fieldAsset,
         field('日期時間', inTs, null, 'f-ts')),
       h('datalist', { id: 'f-assets' }, known.map((a) => h('option', { value: a }, nameOf(a)))),
       fieldQty,
@@ -4098,6 +4195,185 @@ function quoteSection() {
   return box;
 }
 
+/* ---------- 匯入券商成交明細 CSV ---------- */
+/** 解析 CSV（支援雙引號、逗號、換行） */
+function parseCsv(text) {
+  const rows = [];
+  let row = [], cell = '', q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"') { if (text[i + 1] === '"') { cell += '"'; i++; } else q = false; }
+      else cell += c;
+    } else if (c === '"') q = true;
+    else if (c === ',') { row.push(cell); cell = ''; }
+    else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      row.push(cell); rows.push(row); row = []; cell = '';
+    } else cell += c;
+  }
+  if (cell !== '' || row.length) { row.push(cell); rows.push(row); }
+  return rows.map((r) => r.map((x) => x.trim()));
+}
+/** 先試 UTF-8，不是的話用 Big5（舊版券商匯出檔常見） */
+async function readTextAuto(file) {
+  const buf = await file.arrayBuffer();
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(buf).replace(/^﻿/, ''); }
+  catch (e) { try { return new TextDecoder('big5').decode(buf); } catch (e2) { return new TextDecoder('utf-8').decode(buf); } }
+}
+function normName(s) {
+  return String(s || '').replace(/[\s　*＊]/g, '')
+    .replace(/[Ａ-Ｚａ-ｚ０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)).toUpperCase();
+}
+function toNum(s) { const v = parseFloat(String(s == null ? '' : s).replace(/[,\s$]/g, '')); return isFinite(v) ? v : NaN; }
+/** 名稱 → 代號（同名只有一檔時才自動配對） */
+function buildNameIndex() {
+  const idx = {};
+  if (!stockInfo) return idx;
+  Object.keys(stockInfo).forEach((code) => {
+    const k = normName(stockInfo[code][0]);
+    (idx[k] || (idx[k] = [])).push(code);
+  });
+  return idx;
+}
+/**
+ * 把券商的成交明細轉成交易紀錄。
+ * 支援欄位（依標題文字判斷，順序不拘）：股名／股票名稱、代號、日期／成交日期、成交股數／股數、成交價、手續費、交易稅／證交稅、買賣別、委託書號
+ */
+function brokerRowsToTxs(rows) {
+  const hi = rows.findIndex((r) => r.some((c) => /日期/.test(c)) && r.some((c) => /買賣/.test(c)));
+  if (hi < 0) throw new Error('找不到標題列（需要有「日期」與「買賣別」欄位）');
+  const head = rows[hi];
+  const col = (re) => head.findIndex((c) => re.test(c));
+  const C = {
+    name: col(/^(股名|股票名稱|商品名稱|名稱|證券名稱)$/), code: col(/(代號|代碼)/), date: col(/日期/),
+    qty: col(/(成交股數|股數|數量)/), price: col(/成交價|成交單價|價格/), fee: col(/^手續費$/),
+    tax: col(/^(交易稅|證交稅)$/), side: col(/買賣/), order: col(/(委託書號|委託單號|書號)/),
+  };
+  if (C.date < 0 || C.qty < 0 || C.price < 0 || C.side < 0 || (C.name < 0 && C.code < 0)) throw new Error('欄位不足：需要日期、股名或代號、成交股數、成交價、買賣別');
+  const nameIdx = buildNameIndex();
+  const out = [], skipped = [];
+  rows.slice(hi + 1).forEach((r, i) => {
+    if (r.length < head.length - 2 || !r[C.date]) return;
+    const side = r[C.side] || '';
+    let type = null;
+    if (/^(現買|買進|買入|普買|買|零買|定期定額)$/.test(side) || (/買/.test(side) && !/(資|券|沖)/.test(side))) type = 'buy';
+    if (/^(現賣|賣出|普賣|賣|零賣)$/.test(side) || (/賣/.test(side) && !/(資|券|沖)/.test(side))) type = 'sell';
+    const name = C.name >= 0 ? r[C.name] : '';
+    if (!type) { skipped.push((name || r[C.code]) + ' ' + r[C.date] + ' ' + side + '（不支援的交易類別）'); return; }
+    const m = /(\d{3,4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})/.exec(r[C.date]);
+    if (!m) { skipped.push(name + ' ' + r[C.date] + '（日期格式不明）'); return; }
+    let y = +m[1]; if (y < 1911) y += 1911; // 民國年
+    const dateStr = y + '-' + pad2(+m[2]) + '-' + pad2(+m[3]);
+    const qty = toNum(r[C.qty]), price = toNum(r[C.price]);
+    if (!(qty > 0) || !(price >= 0)) { skipped.push(name + ' ' + r[C.date] + '（股數或價格無效）'); return; }
+    let code = C.code >= 0 ? String(r[C.code]).trim().toUpperCase() : '';
+    let cands = [];
+    if (!code) { cands = nameIdx[normName(name)] || []; if (cands.length === 1) code = cands[0]; }
+    const order = C.order >= 0 ? r[C.order] : '';
+    out.push({
+      line: hi + i + 2, name, code, cands, type, dateStr,
+      ts: twDateTs(dateStr) + 13.5 * 3600000, // 只有日期：記在當天 13:30（收盤）
+      qty, price, fee: C.fee >= 0 ? Math.max(0, toNum(r[C.fee]) || 0) : 0,
+      tax: type === 'sell' && C.tax >= 0 ? Math.max(0, toNum(r[C.tax]) || 0) : 0,
+      order, note: '券商匯入' + (order ? ' 委託書號 ' + order : ''),
+    });
+  });
+  return { list: out, skipped };
+}
+/** 帳本裡已經有一樣的紀錄（同股、同日、同買賣、同股數、同價）就視為重複 */
+function isDupTx(x) {
+  return data.txs.some((t) => t.asset === x.code && t.type === x.type && Math.abs(t.qty - x.qty) < 1e-6 &&
+    Math.abs(t.price - x.price) < 1e-6 && twDateStr(t.ts) === x.dateStr &&
+    (!x.order || !t.note || t.note.indexOf('委託書號') < 0 || t.note.indexOf(x.order) >= 0));
+}
+async function importBrokerCsv(file, closeSettings) {
+  let parsed;
+  try {
+    if (!stockInfo) { try { stockInfo = await Market.fetchInfo(false); } catch (e) { /* 沒有名稱表就只能手動填代號 */ } }
+    parsed = brokerRowsToTxs(parseCsv(await readTextAuto(file)));
+  } catch (e) { alertDialog('無法讀取這個檔案', e.message || '格式不符'); return; }
+  const P = parsed.list;
+  if (closeSettings) closeSettings(true);
+  if (!P.length) { alertDialog('沒有可匯入的資料', parsed.skipped.length ? '略過：' + parsed.skipped.slice(0, 5).join('；') : '檔案裡沒有找到成交紀錄。'); return; }
+  modal((close) => {
+    const err = h('div', { class: 'err', role: 'alert' });
+    const info = h('p', { class: 'hint' });
+    const tbody = h('tbody');
+    const codeInputs = [];
+    P.forEach((x) => {
+      const inp = h('input', { type: 'text', class: 'code-in', value: x.code, maxlength: 10, autocapitalize: 'characters', 'aria-label': x.name + ' 代號',
+        placeholder: x.cands.length > 1 ? x.cands.join('/') : '代號' });
+      inp.addEventListener('input', () => {
+        const v = inp.value.trim().toUpperCase();
+        P.forEach((y, j) => { if (y.name === x.name && y !== x && !codeInputs[j].dataset.touched) { codeInputs[j].value = v; } });
+        inp.dataset.touched = '1'; paint();
+      });
+      codeInputs.push(inp);
+      tbody.appendChild(h('tr', null,
+        h('td', { class: 'l' }, x.dateStr),
+        h('td', { class: 'l' }, x.name || '—'),
+        h('td', { class: 'l' }, inp),
+        h('td', { class: 'l' }, h('span', { class: 'tag ' + x.type }, TX_LABEL[x.type])),
+        h('td', null, fmtQty(x.qty)),
+        h('td', null, fmtPrice(x.price, 'TWD')),
+        h('td', null, x.fee ? fmtMoney(x.fee, 'TWD') : '—'),
+        h('td', null, x.tax ? fmtMoney(x.tax, 'TWD') : '—'),
+        h('td', { class: 'l st' })));
+    });
+    function rowsNow() {
+      return P.map((x, i) => Object.assign({}, x, { code: codeInputs[i].value.trim().toUpperCase() }));
+    }
+    function paint() {
+      const R = rowsNow();
+      let ok = 0, dup = 0, bad = 0;
+      R.forEach((x, i) => {
+        const st = tbody.children[i].querySelector('.st');
+        const valid = /^[A-Z0-9]{1,10}$/.test(x.code);
+        const d = valid && isDupTx(x);
+        x._state = !valid ? 'bad' : d ? 'dup' : 'ok';
+        st.textContent = !valid ? '缺代號' : d ? '已存在，略過' : (nameOf(x.code) && x.name && normName(nameOf(x.code)) !== normName(x.name) ? '名稱不同：' + nameOf(x.code) : '匯入');
+        st.className = 'l st ' + x._state;
+        if (x._state === 'ok') ok++; else if (d) dup++; else bad++;
+      });
+      info.textContent = '共 ' + R.length + ' 筆：可匯入 ' + ok + ' 筆' + (dup ? '、重複略過 ' + dup + ' 筆' : '') + (bad ? '、缺代號 ' + bad + ' 筆（請在「代號」欄補上）' : '') +
+        (parsed.skipped.length ? '；另有 ' + parsed.skipped.length + ' 筆不支援已略過（' + parsed.skipped.slice(0, 3).join('；') + (parsed.skipped.length > 3 ? '…' : '') + '）' : '') + '。';
+      return R;
+    }
+    const doImport = async () => {
+      err.textContent = '';
+      const R = paint();
+      if (R.some((x) => x._state === 'bad')) { err.textContent = '還有沒填代號的列，請補上（可在上方「股票代號」欄位輸入）。'; return; }
+      const add = R.filter((x) => x._state === 'ok').map((x) => ({ id: uid(), ts: x.ts, type: x.type, asset: x.code, qty: x.qty, price: x.price, fee: x.fee, tax: x.tax, fx: null, note: x.note }));
+      if (!add.length) { err.textContent = '沒有新的紀錄需要匯入。'; return; }
+      const next = data.txs.concat(add);
+      const over = Engine.replay(next, { method: 'avg' }).issues.filter((i) => i.kind === 'oversell');
+      if (over.length) {
+        const names = Array.from(new Set(over.map((i) => stockLabel(i.asset)))).join('、');
+        const go = await confirmDialog({ title: '有賣出超過持股', body: names + ' 的賣出股數超過帳本裡的持股，可能是這份明細的期間之前就已經持有。仍要匯入嗎？匯入後請再補記較早的買入，帳本才會正確。', confirm: '仍要匯入' });
+        if (!go) return;
+      }
+      close(true);
+      applyTxs(next);
+      toast('已匯入 ' + add.length + ' 筆交易');
+    };
+    paint();
+    return [
+      h('h2', null, '匯入券商成交明細'),
+      h('p', { class: 'lead' }, '確認下面的內容後按「匯入」。手續費與交易稅採用對帳單上的金額；明細只有日期，時間一律記為當天 13:30。代號是依股名自動對應，若有錯可直接修改。'),
+      info,
+      h('div', { class: 'tablewrap', style: { maxHeight: '50vh', overflowY: 'auto' } }, h('table', { class: 'imp' },
+        h('thead', null, h('tr', null, ['日期', '股名', '代號', '類型', '股數', '成交價', '手續費', '交易稅', '狀態'].map((t, i) => h('th', { class: i <= 3 || i === 8 ? 'l' : '' }, t)))),
+        tbody)),
+      err,
+      h('div', { class: 'dlg-actions' },
+        h('button', { class: 'btn', type: 'button', onclick: () => close(false) }, '取消'),
+        h('button', { class: 'btn primary', type: 'button', onclick: doImport }, '匯入')),
+    ];
+  });
+  const ds = document.querySelectorAll('dialog[open]');
+  if (ds.length) ds[ds.length - 1].classList.add('wide');
+}
 /* ---------- 設定 ---------- */
 function openSettings() {
   return modal((close) => {
@@ -4118,6 +4394,7 @@ function openSettings() {
         h('option', { value: o[0], selected: o[0] === s0.idleMin }, o[1])));
 
     const fileIn = h('input', { type: 'file', accept: '.json,application/json', style: { display: 'none' }, onchange: (e) => { const f = e.target.files[0]; e.target.value = ''; if (f) importBackup(f, close); } });
+    const brokerIn = h('input', { type: 'file', accept: '.csv,text/csv', style: { display: 'none' }, onchange: (e) => { const f = e.target.files[0]; e.target.value = ''; if (f) importBrokerCsv(f, close); } });
 
     return [
       h('h2', null, '設定'),
@@ -4133,7 +4410,9 @@ function openSettings() {
           h('button', { class: 'btn', type: 'button', onclick: exportBackup }, '匯出加密備份'),
           h('button', { class: 'btn', type: 'button', onclick: () => fileIn.click() }, '匯入備份'),
           h('button', { class: 'btn', type: 'button', onclick: exportCsv }, '匯出 CSV'),
-          fileIn)),
+          h('button', { class: 'btn', type: 'button', onclick: () => brokerIn.click() }, '匯入券商成交明細（CSV）'),
+          fileIn, brokerIn),
+        h('p', { class: 'hint muted', style: { marginTop: '6px' } }, '券商 App／網站匯出的成交明細 CSV（例如國泰證券），會依股名自動對應代號，匯入前可預覽與修正；重複的紀錄會自動略過。')),
       alertSection(),
       syncSection(),
       h('div', { class: 'sec' },
